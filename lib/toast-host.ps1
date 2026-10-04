@@ -1,4 +1,15 @@
-<# dsh-notify-yimit 常驻浮窗宿主(Windows PowerShell + WPF)。
+﻿<# dsh-notify-yimit 常驻浮窗宿主(Windows PowerShell + WPF)。
+
+★★★ 编码要求:本文件必须保存为「UTF-8 with BOM」(文件头 EF BB BF)。★★★
+本文件含大量中文,而宿主是用 Windows PowerShell 5.1(`powershell.exe`)拉起的,
+PS 5.1 对**没有 BOM** 的 .ps1 会按**系统 ANSI 代码页**解码。在中文 Windows
+(ACP=936/GBK,以及 932/950)下,中文字节会被错误解码、吃掉字符串收尾引号,
+导致整段脚本语法错误 —— 宿主进程秒退,**所有自定义通知全部不显示,且没有任何报错**。
+表现特征:报错行往往是纯 ASCII 行(例如 `$q.Enqueue('{"cmd":"shutdown"}')`),
+真正的病灶在它上面的中文行。
+注意:ACP=65001(UTF-8)的机器上不会复现,PS 7(pwsh)也不会复现 —— 所以本地验证
+必须按 936 解码后再交给解析器,或直接用带 BOM 的文件。
+凡是重写/另存本文件后,请重新确认 BOM 仍在(编辑器与多数脚本化改写都会丢掉它)。
 
 倒计时即进度(本版核心变化):
 - 非粘性通知整卡抽象为倒计时:强调色 @12% "液面层"锚定左缘,ScaleX 1→0,
@@ -667,9 +678,14 @@ public class ToastWin32 {
     $script:ToastWin32Ready = $false
 }
 
-function Write-ActLog([string]$msg) {
+function Write-ActLog([string]$msg, [switch]$Always) {
     # 诊断日志:激活这一步涉及"按 exe 路径找进程 + 枚举窗口"两处环境相关行为,
     # 出问题时按钮只会静默无反应,没有日志无法定位。
+    #
+    # 写入策略(避免往用户安装目录里持续写日志):
+    #   · -Always:仅启动探针使用,每次宿主加载写一行(极小,且是诊断秒退的关键线索);
+    #   · 其余(逐次点击的明细)只有设了 DSH_DEBUG 才写 —— 与插件其它调试输出的约定一致。
+    if (-not $Always -and [string]::IsNullOrEmpty($env:DSH_DEBUG)) { return }
     # 落点优先级:脚本所在目录(真实宿主 = lib/)→ DSH_HOME。
     try {
         $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $msg`r`n"
@@ -693,7 +709,7 @@ try {
     try { $probe += " selfExe='$((Get-Process -Id $PID).Path)'" } catch { $probe += " selfExe=<取不到>" }
     try { $probe += " DSH_HOME='$env:DSH_HOME'" } catch { }
     try { $probe += " PSScriptRoot='$PSScriptRoot'" } catch { }
-    Write-ActLog $probe
+    Write-ActLog $probe -Always
 } catch { }
 
 function Invoke-ToastActivateApp([string]$appPath) {
