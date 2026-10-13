@@ -544,131 +544,266 @@ try {
     if (-not ('ToastWin32' -as [type])) {
         Add-Type -TypeDefinition @'
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using System.Threading;
 using System.Runtime.InteropServices;
 
+// 「返回应用」的窗口定位与激活(仅 Windows 桌面端使用)。
+//
+// 这里记录两个实测复现过的故障,避免以后又被改回去:
+//
+// ① 点「返回应用」没反应、应用还像卡住 —— 幽灵窗口抢走了前台
+//    旧 FindMainWindow 是"按 pid 各自挑一个候选窗口",调用侧又是"第一个 pid 挑到
+//    非零就 return"。而 Electron 的渲染/工具进程各自带一个 0×0 的隐形
+//    "Default IME" 窗口(类名 IME、标题非空 → 三级分级全过),于是它被当成主窗口
+//    返回;而 SetForegroundWindow 对 0×0 隐形窗口**也会成功**:
+//        click: hwnd=0x0012007E ok=True 前台=0x0012007E   ← 0×0 的 IME 幽灵窗口
+//        >>> 原版在这里 return:真正的主窗口(Chrome_WidgetWin_1)从未被尝试激活
+//    前台被隐形窗口抢走,应用整体失去前台/焦点 —— 用户看到的就是"没反应 + 卡住"。
+//
+// ② 点击的瞬间整个浮窗宿主冻结
+//    这一整套(枚举数百个进程 + EnumWindows + SetForegroundWindow)原本同步跑在按钮
+//    的 MouseLeftButtonUp 里,也就是 WPF 派发线程上。SetForegroundWindow 会同步给
+//    目标线程发消息,目标线程不抽消息时会一直阻塞 —— 宿主随之冻结:浮窗不重绘、
+//    按钮不回弹、「忽略」点不动、到点该消失的浮窗也不消失。
+//
+// 修复要点:
+//   ① 跨**全部**候选 pid 全局比较 (tier, 面积),并按面积 + 窗口类剔除 IME / GDI+ hook
+//      等幽灵窗口,不再"先挑到就用";
+//   ② 整个流程丢到后台线程(ActivateAppAsync),派发线程约 0ms 返回,浮窗永不冻结;
+//   ③ AttachThreadInput 改用**当前线程**(原实现错用了 GetShellWindow() 所属线程,
+//      那是 explorer 的输入队列),并先 PeekMessage 建立本线程消息队列 ——
+//      新线程默认没有消息队列,否则 attach 必定失败;
+//   ④ 进程匹配先按进程名筛、再校验 exe 全路径,避免遍历全部进程(实测 2.7s → 47ms);
+//   ⑤ 每次点击固定写一行结论到 activate-debug.log(逐候选明细仍由 DSH_DEBUG 门控),
+//      同类问题以后不再是"静默无反应"。
 public class ToastWin32 {
-    public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+	[StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+	[StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+	[StructLayout(LayoutKind.Sequential)]
+	public struct WINDOWPLACEMENT {
+		public int length; public int flags; public int showCmd;
+		public POINT ptMinPosition; public POINT ptMaxPosition; public RECT rcNormalPosition;
+	}
+	[StructLayout(LayoutKind.Sequential)]
+	public struct MSG {
+		public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam;
+		public uint time; public int ptX; public int ptY;
+	}
 
-    [StructLayout(LayoutKind.Sequential)]
-    public struct RECT { public int Left, Top, Right, Bottom; }
+	public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
 
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr p);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextLength(IntPtr h);
-    [DllImport("user32.dll")] public static extern IntPtr GetShellWindow();
-    [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool f);
-    [DllImport("user32.dll")] public static extern bool GetWindowPlacement(IntPtr h, ref WINDOWPLACEMENT wp);
-    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
-    [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
+	[DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr p);
+	[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+	[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+	[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextLength(IntPtr h);
+	[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+	[DllImport("user32.dll")] public static extern IntPtr GetShellWindow();
+	[DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
+	[DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+	[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+	[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+	[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+	[DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool f);
+	[DllImport("user32.dll")] public static extern bool GetWindowPlacement(IntPtr h, ref WINDOWPLACEMENT wp);
+	[DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+	[DllImport("user32.dll")] public static extern IntPtr SetActiveWindow(IntPtr h);
+	[DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
+	[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool PeekMessage(out MSG m, IntPtr h, uint min, uint max, uint remove);
+	[DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
 
-    [StructLayout(LayoutKind.Sequential)]
-    public struct POINT { public int X, Y; }
+	private const uint GW_OWNER = 4;
+	private const int SW_SHOWMINIMIZED = 2, SW_SHOWMAXIMIZED = 3, SW_SHOW = 5, SW_RESTORE = 9;
+	private const int WPF_RESTORETOMAXIMIZED = 0x0002;
+	// 主窗口最小面积:IME / GDI+ hook / 幽灵窗口都是 0×0,真实主窗口远大于此。
+	private const long MIN_AREA = 120L * 120L;
 
-    [StructLayout(LayoutKind.Sequential)]
-    public struct WINDOWPLACEMENT {
-        public int length;
-        public int flags;
-        public int showCmd;
-        public POINT ptMinPosition;
-        public POINT ptMaxPosition;
-        public RECT rcNormalPosition;
-    }
+	private static int activateBusy = 0;
 
-    private const uint GW_OWNER = 4;
-    private const int SW_SHOWNORMAL = 1;
-    private const int SW_SHOWMINIMIZED = 2;
-    private const int SW_SHOWMAXIMIZED = 3;
-    private const int SW_SHOW = 5;
-    private const int SW_RESTORE = 9;
-    /// WPF_RESTORETOMAXIMIZED:最小化前是最大化状态
-    private const int WPF_RESTORETOMAXIMIZED = 0x0002;
+	/// 绝不可能是主窗口的窗口类。
+	private static bool IsJunkClass(string cls) {
+		if (cls == null || cls.Length == 0) return true;
+		if (cls == "IME" || cls == "MSCTFIME UI" || cls == "Default IME") return true;
+		if (cls == "GDI+ Hook Window Class" || cls == "tooltips_class32") return true;
+		if (cls == "SysShadow" || cls == "ForegroundStaging") return true;
+		return false;
+	}
 
-    /// 找出 pid 名下最可能是"主窗口"的顶层窗口。
-    ///
-    /// 实测要点(这台机器上枚举到 280 个窗口、其中 20 个可见):
-    /// 应用最小化到托盘 / 被隐藏时,它的主窗口会变成 **不可见**,甚至带上 owner
-    /// 关系。若像最初那样要求"可见 + 非 owner",这两条会把主窗口全部滤掉,
-    /// 结果就是"点了返回应用没反应"。因此这里分级挑选:
-    ///   1) 可见 + 有标题 + 非 owner(正常情况,最可靠)
-    ///   2) 有标题 + 非 owner(隐藏/托盘态)
-    ///   3) 有标题(连 owner 关系都能容忍)
-    /// 每级内部取面积最大者,Electron 的辅助窗口通常面积很小或没有标题。
-    public static IntPtr FindMainWindow(uint pid) {
-        IntPtr shell = GetShellWindow();
-        IntPtr[] best = new IntPtr[3];
-        long[] bestArea = new long[3] { -1, -1, -1 };
-        EnumWindows(delegate(IntPtr h, IntPtr p) {
-            uint wpid = 0;
-            GetWindowThreadProcessId(h, out wpid);
-            if (wpid != pid) return true;
-            if (h == shell) return true;
-            if (GetWindowTextLength(h) <= 0) return true;
+	/// 跨**全部**候选 pid 挑主窗口:先剔幽灵窗口 + 面积门槛,
+	/// 再按 (可见且非 owner > 非 owner > owner, 面积大) 取最优。
+	/// 面积门槛失配时放宽一次(托盘隐藏窗口的矩形可能已归零),但仍排除幽灵类。
+	public static IntPtr FindMainWindow(uint[] pids) {
+		IntPtr hit = Search(pids, true);
+		if (hit != IntPtr.Zero) return hit;
+		return Search(pids, false);
+	}
 
-            bool visible = IsWindowVisible(h);
-            bool owned = GetWindow(h, GW_OWNER) != IntPtr.Zero;
-            RECT r;
-            if (!GetWindowRect(h, out r)) return true;
-            long area = (long)(r.Right - r.Left) * (long)(r.Bottom - r.Top);
+	private static IntPtr Search(uint[] pids, bool enforceArea) {
+		if (pids == null || pids.Length == 0) return IntPtr.Zero;
+		Dictionary<uint, bool> want = new Dictionary<uint, bool>();
+		for (int i = 0; i < pids.Length; i++) want[pids[i]] = true;
+		IntPtr shell = GetShellWindow();
+		IntPtr best = IntPtr.Zero;
+		int bestTier = 99;
+		long bestArea = -1;
+		EnumWindows(delegate(IntPtr h, IntPtr p) {
+			uint wpid = 0;
+			GetWindowThreadProcessId(h, out wpid);
+			if (!want.ContainsKey(wpid)) return true;
+			if (h == shell) return true;
+			if (GetWindowTextLength(h) <= 0) return true;
+			StringBuilder cls = new StringBuilder(256);
+			GetClassName(h, cls, cls.Capacity);
+			if (IsJunkClass(cls.ToString())) return true;
+			RECT r;
+			if (!GetWindowRect(h, out r)) return true;
+			long area = (long)(r.Right - r.Left) * (long)(r.Bottom - r.Top);
+			if (enforceArea && area < MIN_AREA) return true;
+			bool visible = IsWindowVisible(h);
+			bool owned = GetWindow(h, GW_OWNER) != IntPtr.Zero;
+			int tier = (visible && !owned) ? 0 : (!owned ? 1 : 2);
+			if (tier < bestTier || (tier == bestTier && area > bestArea)) {
+				bestTier = tier; bestArea = area; best = h;
+			}
+			return true;
+		}, IntPtr.Zero);
+		return best;
+	}
 
-            int tier;
-            if (visible && !owned) tier = 0;
-            else if (!owned) tier = 1;
-            else tier = 2;
+	/// 把 hWnd 提到前台,并保持窗口原有的尺寸/最大化状态。
+	/// 最小化 → SW_RESTORE(原先最大化会恢复成最大化);最大化 → SW_SHOWMAXIMIZED;
+	/// 普通/隐藏 → SW_SHOW(只显示置顶,不改尺寸)。
+	public static bool Activate(IntPtr h) {
+		if (h == IntPtr.Zero) return false;
 
-            if (area > bestArea[tier]) { bestArea[tier] = area; best[tier] = h; }
-            return true;
-        }, IntPtr.Zero);
+		WINDOWPLACEMENT wp = new WINDOWPLACEMENT();
+		wp.length = Marshal.SizeOf(typeof(WINDOWPLACEMENT));
+		int show = SW_SHOW;
+		if (GetWindowPlacement(h, ref wp)) {
+			int cur = wp.showCmd;
+			if (cur == SW_SHOWMINIMIZED) {
+				show = (wp.flags & WPF_RESTORETOMAXIMIZED) != 0 ? SW_SHOWMAXIMIZED : SW_RESTORE;
+			} else if (cur == SW_SHOWMAXIMIZED) {
+				show = SW_SHOWMAXIMIZED;
+			}
+		}
+		ShowWindow(h, show);
 
-        for (int i = 0; i < 3; i++) { if (best[i] != IntPtr.Zero) return best[i]; }
-        return IntPtr.Zero;
-    }
+		// 后台线程默认没有消息队列,而 AttachThreadInput 要求双方都有队列 → 先建一个。
+		MSG msg;
+		PeekMessage(out msg, IntPtr.Zero, 0, 0, 0);
 
-    /// 把 hWnd 提到前台,并**保持窗口原有的尺寸/最大化状态**。
-    ///
-    /// 关键:`ShowWindow(h, SW_RESTORE)` 会把"最小化**或**最大化"的窗口还原成
-    /// 原始(默认)尺寸 —— 这正是"窗口本来最大化、只是不在最上层,点返回应用后
-    /// 变成默认大小"的原因。所以这里必须先查询显示状态:
-    ///   · 最小化 → SW_RESTORE(恢复原尺寸,若原先最大化会恢复成最大化)
-    ///   · 最大化 → SW_SHOWMAXIMIZED
-    ///   · 普通   → SW_SHOW(只显示/置顶,**不改尺寸**)
-    /// SetForegroundWindow 受"仅前台进程可抢占前台"限制,失败时按通行做法
-    /// 附加到当前前台线程的输入队列后重试一次。
-    public static bool Activate(IntPtr h) {
-        if (h == IntPtr.Zero) return false;
+		uint myTid = GetCurrentThreadId();
+		uint fgTid = 0;
+		IntPtr fg = GetForegroundWindow();
+		if (fg != IntPtr.Zero && fg != h) {
+			uint dummy = 0;
+			fgTid = GetWindowThreadProcessId(fg, out dummy);
+		}
+		bool attached = false;
+		if (fgTid != 0 && fgTid != myTid) {
+			try { attached = AttachThreadInput(myTid, fgTid, true); } catch { attached = false; }
+		}
+		bool ok = SetForegroundWindow(h);
+		if (!ok) {
+			BringWindowToTop(h);
+			SetActiveWindow(h);
+			SetFocus(h);
+			ok = SetForegroundWindow(h);
+		}
+		if (attached) {
+			try { AttachThreadInput(myTid, fgTid, false); } catch { }
+		}
+		return ok || GetForegroundWindow() == h;
+	}
 
-        WINDOWPLACEMENT wp = new WINDOWPLACEMENT();
-        wp.length = Marshal.SizeOf(typeof(WINDOWPLACEMENT));
-        int show = SW_SHOW;
-        if (GetWindowPlacement(h, ref wp)) {
-            int cur = wp.showCmd;
-            if (cur == SW_SHOWMINIMIZED) {
-                show = (wp.flags & WPF_RESTORETOMAXIMIZED) != 0 ? SW_SHOWMAXIMIZED : SW_RESTORE;
-            } else if (cur == SW_SHOWMAXIMIZED) {
-                show = SW_SHOWMAXIMIZED;
-            }
-        }
-        ShowWindow(h, show);
+	/// 点击「返回应用」的入口:**立即返回**,真正的工作在后台线程完成。
+	public static void ActivateAppAsync(string appPath, string logPath, bool verbose) {
+		if (Interlocked.CompareExchange(ref activateBusy, 1, 0) != 0) {
+			Log(logPath, verbose, "click: 上一次激活尚未结束,忽略本次连点");
+			return;
+		}
+		Thread t = new Thread(delegate() {
+			try { ActivateAppCore(appPath, logPath, verbose); }
+			catch (Exception e) { Log(logPath, true, "click 异常: " + e.GetType().Name + " :: " + e.Message); }
+			finally { Interlocked.Exchange(ref activateBusy, 0); }
+		});
+		t.IsBackground = true;
+		t.Name = "dsh-notify-activate";
+		try { t.Start(); }
+		catch (Exception e) { Interlocked.Exchange(ref activateBusy, 0); Log(logPath, true, "click 线程启动失败: " + e.Message); }
+	}
 
-        if (SetForegroundWindow(h)) return true;
-        IntPtr fg = GetForegroundWindow();
-        uint dummy = 0;
-        uint tidFg = fg == IntPtr.Zero ? 0u : GetWindowThreadProcessId(fg, out dummy);
-        uint tidMe = GetWindowThreadProcessId(GetShellWindow(), out dummy);
-        if (tidFg != 0u && tidFg != tidMe) {
-            if (AttachThreadInput(tidMe, tidFg, true)) {
-                bool ok = SetForegroundWindow(h);
-                AttachThreadInput(tidMe, tidFg, false);
-                if (ok) return true;
-            }
-        }
-        return SetForegroundWindow(h);
-    }
+	private static void ActivateAppCore(string appPath, string logPath, bool verbose) {
+		int t0 = Environment.TickCount;
+		if (appPath == null || appPath.Length == 0) { Log(logPath, true, "click: 中止,appPath 为空"); return; }
+		string full = null;
+		try { full = Path.GetFullPath(appPath); } catch { Log(logPath, true, "click: 中止,GetFullPath 失败"); return; }
+		bool exists = false;
+		try { exists = File.Exists(full); } catch { }
+		Log(logPath, verbose, "--- click --- full='" + full + "' exists=" + exists);
+		if (!exists) { Log(logPath, true, "click: 中止,exe 路径不存在 '" + full + "'"); return; }
+
+		uint[] pids = PidsForExe(full);
+		Log(logPath, verbose, "候选 pid 数=" + pids.Length + " pids=" + JoinPids(pids));
+		if (pids.Length == 0) { Log(logPath, true, "click: 未找到目标进程 exe='" + full + "'"); return; }
+
+		IntPtr h = FindMainWindow(pids);
+		if (h == IntPtr.Zero) {
+			Log(logPath, true, "click: 未找到可激活窗口 exe='" + full + "' pids=" + JoinPids(pids) +
+				" 用时=" + (Environment.TickCount - t0) + "ms");
+			return;
+		}
+		bool ok = Activate(h);
+		Log(logPath, true, "click: hwnd=0x" + h.ToInt64().ToString("X8") + " ok=" + ok +
+			" 前台=0x" + GetForegroundWindow().ToInt64().ToString("X8") +
+			" 用时=" + (Environment.TickCount - t0) + "ms");
+	}
+
+	/// Electron 主进程与各渲染/工具进程是同一个 exe,窗口可能挂在其中任意一个 pid 上,
+	/// 所以要把全部同 exe 进程作为一组返回。
+	///
+	/// 实现上先按**进程名**筛(进程名来自系统快照,无需 OpenProcess,极快),
+	/// 再只对这几个候选校验 exe 全路径 —— 原先是"遍历全部进程逐个取 Path",
+	/// 实测本机 376 个进程要 250ms~2.7s,慢且没必要。
+	/// 路径取不到时保留该候选(与原实现"按进程名兜底"的宽容度一致)。
+	private static uint[] PidsForExe(string full) {
+		List<uint> list = new List<uint>();
+		string name = Path.GetFileNameWithoutExtension(full);
+		if (name == null || name.Length == 0) return list.ToArray();
+		Process[] cands;
+		try { cands = Process.GetProcessesByName(name); } catch { return list.ToArray(); }
+		for (int i = 0; i < cands.Length; i++) {
+			bool keep = true;
+			try { keep = string.Equals(cands[i].MainModule.FileName, full, StringComparison.OrdinalIgnoreCase); }
+			catch { keep = true; }
+			if (keep) { try { list.Add((uint)cands[i].Id); } catch { } }
+		}
+		return list.ToArray();
+	}
+
+	private static string JoinPids(uint[] pids) {
+		StringBuilder sb = new StringBuilder();
+		for (int i = 0; i < pids.Length; i++) {
+			if (i > 0) sb.Append(",");
+			sb.Append(pids[i].ToString());
+		}
+		return sb.ToString();
+	}
+
+	/// 诊断日志:每次点击固定写一行结论;逐候选明细只在 verbose(DSH_DEBUG)时写。
+	/// 追加写、失败即放弃 —— 日志本身绝不能影响激活。
+	private static void Log(string path, bool always, string msg) {
+		if (!always) return;
+		if (path == null || path.Length == 0) return;
+		try {
+			string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + msg + "\r\n";
+			File.AppendAllText(path, line, new UTF8Encoding(false));
+		} catch { }
+	}
 }
 '@ -ErrorAction Stop
     }
@@ -678,27 +813,34 @@ public class ToastWin32 {
     $script:ToastWin32Ready = $false
 }
 
+# 诊断日志落点:脚本所在目录(真实宿主 = lib/)→ DSH_HOME。
+# 抽成 $script:ActLogPath 是因为点「返回应用」的明细现在由 C# 后台线程写,
+# 那条路径拿不到 PS 里的变量,必须把文件路径显式传进去。
+$script:ActLogPath = $null
+$script:ActVerbose = -not [string]::IsNullOrEmpty($env:DSH_DEBUG)
+try {
+    $logDirs = @()
+    if (-not [string]::IsNullOrEmpty($PSScriptRoot)) { $logDirs += $PSScriptRoot }
+    if (-not [string]::IsNullOrEmpty($env:DSH_HOME)) { $logDirs += $env:DSH_HOME }
+    foreach ($d in $logDirs) {
+        try {
+            $cand = Join-Path $d 'activate-debug.log'
+            [System.IO.File]::AppendAllText($cand, '', (New-Object System.Text.UTF8Encoding($false)))
+            $script:ActLogPath = $cand
+            break
+        } catch { }
+    }
+} catch { }
+
 function Write-ActLog([string]$msg, [switch]$Always) {
-    # 诊断日志:激活这一步涉及"按 exe 路径找进程 + 枚举窗口"两处环境相关行为,
-    # 出问题时按钮只会静默无反应,没有日志无法定位。
-    #
-    # 写入策略(避免往用户安装目录里持续写日志):
-    #   · -Always:仅启动探针使用,每次宿主加载写一行(极小,且是诊断秒退的关键线索);
-    #   · 其余(逐次点击的明细)只有设了 DSH_DEBUG 才写 —— 与插件其它调试输出的约定一致。
-    if (-not $Always -and [string]::IsNullOrEmpty($env:DSH_DEBUG)) { return }
-    # 落点优先级:脚本所在目录(真实宿主 = lib/)→ DSH_HOME。
+    # 逐次点击的明细只有设了 DSH_DEBUG 才写(C# 侧同样按 $script:ActVerbose 门控),
+    # 启动探针用 -Always 在每次宿主加载时固定写一行(诊断"秒退"的关键线索)。
+    if (-not $Always -and -not $script:ActVerbose) { return }
+    if ([string]::IsNullOrEmpty($script:ActLogPath)) { return }
     try {
         $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $msg`r`n"
         $enc = New-Object System.Text.UTF8Encoding($false)
-        $dirs = @()
-        if (-not [string]::IsNullOrEmpty($PSScriptRoot)) { $dirs += $PSScriptRoot }
-        if (-not [string]::IsNullOrEmpty($env:DSH_HOME)) { $dirs += $env:DSH_HOME }
-        foreach ($d in $dirs) {
-            try {
-                [System.IO.File]::AppendAllText((Join-Path $d 'activate-debug.log'), $line, $enc)
-                return
-            } catch { }
-        }
+        [System.IO.File]::AppendAllText($script:ActLogPath, $line, $enc)
     } catch { }
 }
 
@@ -712,40 +854,26 @@ try {
     Write-ActLog $probe -Always
 } catch { }
 
+# 点击「返回应用」:立刻返回,真正的进程枚举 + 窗口激活交给后台线程
+# (ToastWin32.ActivateAppAsync)。
+#
+# 旧实现为什么必须换掉(实测根因):
+#   ① 旧 ToastWin32.FindMainWindow 是"每个 pid 各挑一个候选窗口",这里又是
+#      "第一个 pid 挑到非零就 return"。Electron 的渲染/工具进程各自带一个 0×0 的
+#      "Default IME" 幽灵窗口(类名 IME、标题非空 → 三级分级全过),于是它被当成
+#      主窗口返回;而 SetForegroundWindow 对 0×0 隐形窗口**也会成功** → 前台被
+#      隐形窗口抢走,真正的主窗口永远不会被尝试激活:用户看到的就是
+#      "点了返回应用没反应",而应用丢掉前台/焦点,整体看上去像卡住。
+#   ② 旧实现整套(枚举数百个进程 + EnumWindows + SetForegroundWindow)同步跑在按钮的
+#      MouseLeftButtonUp 里,也就是宿主**派发线程**上。SetForegroundWindow 会同步给
+#      目标线程发消息,目标线程不抽消息时会一直阻塞 —— 整个浮窗宿主随之冻结:
+#      浮窗不重绘、按钮不回弹、「忽略」点不动、到点该消失的也不消失。
+# 现在这里只投递一个后台线程(内部会合并连点),派发线程约 0ms 返回,浮窗永不卡。
 function Invoke-ToastActivateApp([string]$appPath) {
     try {
-        Write-ActLog "--- click ---"
-        Write-ActLog "Win32Ready=$script:ToastWin32Ready appPath='$appPath'"
-        if (-not $script:ToastWin32Ready) { Write-ActLog "中止: Win32 助手不可用"; return }
-        if ([string]::IsNullOrEmpty($appPath)) { Write-ActLog "中止: appPath 为空"; return }
-        $full = $null
-        try { $full = [System.IO.Path]::GetFullPath($appPath) } catch { Write-ActLog "中止: GetFullPath 失败"; return }
-        Write-ActLog "full='$full' exists=$(Test-Path -LiteralPath $full)"
-        if (-not (Test-Path -LiteralPath $full)) { Write-ActLog "中止: exe 路径不存在"; return }
-
-        # Electron 的主进程与各渲染进程都是同一个 exe,窗口可能挂在其中任意一个 PID 上,
-        # 所以把全部同 exe 的进程当作一组来挑窗口,而不是"谁先回答就用谁"。
-        $procs = @()
-        foreach ($p in (Get-Process -ErrorAction SilentlyContinue)) {
-            try { if ($p.Path -eq $full) { $procs += $p } } catch { }
-        }
-        Write-ActLog "按 exe 匹配=$($procs.Count) pids=$(($procs | ForEach-Object { $_.Id }) -join ',')"
-        if ($procs.Count -eq 0) {
-            # 兜底:按进程名匹配(某些情况下 Path 取不到)。
-            $nm = [System.IO.Path]::GetFileNameWithoutExtension($full)
-            $procs = @(Get-Process -Name $nm -ErrorAction SilentlyContinue)
-            Write-ActLog "按名 '$nm' 兜底=$($procs.Count) pids=$(($procs | ForEach-Object { $_.Id }) -join ',')"
-        }
-        foreach ($p in $procs) {
-            $h = [ToastWin32]::FindMainWindow([uint32]$p.Id)
-            Write-ActLog "  pid=$($p.Id) hwnd=$h"
-            if ($h -ne [IntPtr]::Zero) {
-                $ok = [ToastWin32]::Activate($h)
-                Write-ActLog "  Activate=$ok fg=$([ToastWin32]::GetForegroundWindow())"
-                if ($ok) { return }
-            }
-        }
-        Write-ActLog "结束: 未找到可激活窗口"
+        if (-not $script:ToastWin32Ready) { return }
+        if ([string]::IsNullOrEmpty($appPath)) { return }
+        [ToastWin32]::ActivateAppAsync($appPath, $script:ActLogPath, [bool]$script:ActVerbose)
     } catch {
         Write-ActLog "异常: $($_.Exception.GetType().Name) :: $($_.Exception.Message)"
     }
