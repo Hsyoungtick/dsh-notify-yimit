@@ -1067,7 +1067,7 @@ function New-ToastWindow($cmd) {
     $ignoreBtn = New-ToastButton $ignoreLabel ({ Close-WithFade $win }.GetNewClosure()) $false $fgBrush $bgBrush
     $btnRow.Children.Add($ignoreBtn) | Out-Null
     # 「返回应用」:位于「忽略」右侧;仅桌面端出现(由 index.js 按 isDesktopRuntime 下发
-    # activateLabel)。点击后把应用窗口切到前台,但**不**关闭本条通知。
+    # activateLabel)。点击后把应用窗口切到前台,并**关闭本条通知**(与「忽略」一致)。
     # 另外要求 Win32 互操作可用(否则无法激活窗口,宁可不显示这个按钮)。
     $activateLabel = [string]$cmd.activateLabel
     $appPath = [string]$cmd.appPath
@@ -1075,7 +1075,11 @@ function New-ToastWindow($cmd) {
         -not [string]::IsNullOrEmpty($appPath)) {
         $activateBtn = New-ToastButton $activateLabel ({
             Invoke-ToastActivateApp $appPath
-            # 按要求保留通知,不做 Close-WithFade。
+            # 先投递后台激活线程,再淡出关闭(与「忽略」同样的退场动画)。
+            # 顺序不能反:激活依赖"此刻宿主仍是前台进程"这条 SetForegroundWindow 限制,
+            # 而 Close-WithFade 有 200ms 淡出、激活通常 50ms 内完成,
+            # 所以先投递再关闭,能保证激活那一刻浮窗还活着(否则可能被拒绝)。
+            Close-WithFade $win
         }.GetNewClosure()) $false $fgBrush $bgBrush
         $btnRow.Children.Add($activateBtn) | Out-Null
     }
